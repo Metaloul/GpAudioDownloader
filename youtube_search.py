@@ -224,13 +224,13 @@ class YouTubeSearcher:
         for i, (score, result) in enumerate(scored_results[:3]):
             print(f"{i+1}. Score: {score} - {result['title']}")
         
-        # Retourner la meilleure URL si le score est positif
-        if scored_results and scored_results[0][0] > 0:
-            return scored_results[0][1]['url']
-        
-        # Si aucun résultat n'a un score positif, prendre le premier quand même
+        # Retourner la première meilleure URL (en cas d'égalité, prendre le premier)
         if scored_results:
-            return scored_results[0][1]['url']
+            best_score = scored_results[0][0]
+            # Prendre le premier résultat avec le meilleur score
+            for score, result in scored_results:
+                if score == best_score:
+                    return result['url']
         
         return None
 

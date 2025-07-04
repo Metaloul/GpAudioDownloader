@@ -12,10 +12,10 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
     QWidget, QPushButton, QLabel, QLineEdit, QFileDialog,
-    QProgressBar, QTextEdit, QGroupBox, QMessageBox
+    QProgressBar, QTextEdit, QGroupBox, QMessageBox, QMenuBar
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QFont, QIcon, QAction
 
 from downloader import AudioDownloader
 from gp_parser import GuitarProParser
@@ -36,10 +36,19 @@ class DownloadWorker(QThread):
         self.downloader = AudioDownloader(output_path)
         self.parser = GuitarProParser()
         self._stop_requested = False
+        self._pause_requested = False
         
     def stop(self):
         """Arrêter le téléchargement"""
         self._stop_requested = True
+        
+    def pause(self):
+        """Mettre en pause le téléchargement"""
+        self._pause_requested = True
+        
+    def resume(self):
+        """Reprendre le téléchargement"""
+        self._pause_requested = False
         
     def run(self):
         try:
@@ -79,6 +88,15 @@ class DownloadWorker(QThread):
             self.status_updated.emit(f"Trouvé {total_files} nouveau(x) fichier(s) à traiter")
             
             for i, gp_file in enumerate(filtered_files):
+                if self._stop_requested:
+                    self.status_updated.emit("⏹️ Téléchargement arrêté par l'utilisateur")
+                    return
+                    
+                # Gérer la pause
+                while self._pause_requested and not self._stop_requested:
+                    self.status_updated.emit("⏸️ Téléchargement en pause...")
+                    self.msleep(500)  # Attendre 500ms avant de vérifier à nouveau
+                    
                 if self._stop_requested:
                     self.status_updated.emit("⏹️ Téléchargement arrêté par l'utilisateur")
                     return
@@ -212,14 +230,56 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+        self.download_worker = None
+        self.is_paused = False
         self.init_ui()
         self.load_settings()
-        self.download_worker = None
+        self.setup_icon()
         
+    def setup_icon(self):
+        """Configurer l'icône de l'application"""
+        try:
+            # Essayer d'abord le fichier .ico
+            icon_path = os.path.join(os.path.dirname(__file__), "app_logo.ico")
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+            else:
+                # Fallback sur le fichier .png
+                icon_path = os.path.join(os.path.dirname(__file__), "app_logo.png")
+                if os.path.exists(icon_path):
+                    self.setWindowIcon(QIcon(icon_path))
+        except Exception as e:
+             print(f"Erreur lors du chargement de l'icône: {e}")
+     
+    def create_menu(self):
+        """Créer le menu de l'application"""
+        menubar = self.menuBar()
+        
+        # Menu Outils
+        tools_menu = menubar.addMenu('Outils')
+        
+        # Action pour vider le cache
+        clear_cache_action = QAction('Vider le cache', self)
+        clear_cache_action.setStatusTip('Vider le cache des fichiers traités')
+        clear_cache_action.triggered.connect(self.clear_cache)
+        tools_menu.addAction(clear_cache_action)
+        
+        # Menu Aide
+        help_menu = menubar.addMenu('Aide')
+        
+        # Action À propos
+        about_action = QAction('À propos', self)
+        about_action.setStatusTip('À propos de GP Audio Downloader')
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+    
     def init_ui(self):
         """Initialiser l'interface utilisateur"""
         self.setWindowTitle("GP Audio Downloader")
         self.setGeometry(100, 100, 800, 600)
+        
+        # Créer le menu
+        self.create_menu()
         
         # Widget central
         central_widget = QWidget()
@@ -306,9 +366,31 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        self.clear_cache_button = QPushButton("Vider le cache")
-        self.clear_cache_button.clicked.connect(self.clear_cache)
-        self.clear_cache_button.setStyleSheet("""
+        self.pause_button = QPushButton("⏸️ Pause")
+        self.pause_button.setEnabled(False)
+        self.pause_button.clicked.connect(self.toggle_pause)
+        self.pause_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f39c12;
+                color: white;
+                border: none;
+                padding: 12px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #e67e22;
+            }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
+        """)
+        
+        self.stop_button = QPushButton("⏹️ Arrêter")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_download)
+        self.stop_button.setStyleSheet("""
             QPushButton {
                 background-color: #e74c3c;
                 color: white;
@@ -321,10 +403,14 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background-color: #c0392b;
             }
+            QPushButton:disabled {
+                background-color: #bdc3c7;
+            }
         """)
         
         buttons_layout.addWidget(self.download_button)
-        buttons_layout.addWidget(self.clear_cache_button)
+        buttons_layout.addWidget(self.pause_button)
+        buttons_layout.addWidget(self.stop_button)
         main_layout.addLayout(buttons_layout)
         
         # Barre de progression
@@ -436,8 +522,11 @@ class MainWindow(QMainWindow):
         exceptions_text = self.exceptions_edit.toPlainText()
         exceptions = [line.strip() for line in exceptions_text.split('\n') if line.strip()]
         
-        # Désactiver le bouton et afficher la progression
+        # Gérer l'état des boutons
         self.download_button.setEnabled(False)
+        self.pause_button.setEnabled(True)
+        self.stop_button.setEnabled(True)
+        self.is_paused = False
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_text.clear()
@@ -467,14 +556,67 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.status_text.append("\n✅ Téléchargement terminé avec succès!")
         self.download_button.setEnabled(True)
+        self.pause_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.pause_button.setText("⏸️ Pause")
+        self.is_paused = False
         QMessageBox.information(self, "Succès", "Tous les téléchargements sont terminés!")
         
     def download_error(self, error_message):
         """Erreur lors du téléchargement"""
         self.status_text.append(f"\n❌ Erreur: {error_message}")
         self.download_button.setEnabled(True)
+        self.pause_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "Erreur", error_message)
+        
+    def toggle_pause(self):
+        """Basculer entre pause et reprise"""
+        if self.download_worker and self.download_worker.isRunning():
+            if self.is_paused:
+                self.download_worker.resume()
+                self.pause_button.setText("⏸️ Pause")
+                self.is_paused = False
+                self.status_text.append("▶️ Téléchargement repris")
+            else:
+                self.download_worker.pause()
+                self.pause_button.setText("▶️ Reprendre")
+                self.is_paused = True
+                self.status_text.append("⏸️ Téléchargement mis en pause")
+                
+    def stop_download(self):
+        """Arrêter le téléchargement"""
+        if self.download_worker and self.download_worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Confirmation",
+                "Êtes-vous sûr de vouloir arrêter le téléchargement ?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.download_worker.stop()
+                self.download_worker.wait(3000)
+                self.download_button.setEnabled(True)
+                self.pause_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+                self.pause_button.setText("⏸️ Pause")
+                self.is_paused = False
+                self.progress_bar.setVisible(False)
+                self.status_text.append("🛑 Téléchargement arrêté par l'utilisateur")
+                
+    def show_about(self):
+        """Afficher les informations sur l'application"""
+        QMessageBox.about(
+            self,
+            "À propos",
+            "<h3>GP Audio Downloader</h3>"
+            "<p>Version 1.0</p>"
+            "<p>Application pour télécharger automatiquement les fichiers audio correspondant aux tablatures Guitar Pro.</p>"
+            "<p>Développé avec Python et PySide6</p>"
+        )
         
     def clear_cache(self):
         """Vider le cache des fichiers traités"""
