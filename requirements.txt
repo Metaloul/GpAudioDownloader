@@ -1,0 +1,15 @@
+# Interface graphique
+PySide6>=6.5.0
+
+# Téléchargement de vidéos/audio
+yt-dlp>=2023.7.6
+
+# Traitement audio (optionnel, pour la conversion)
+pydub>=0.25.1
+
+# Utilitaires
+requests>=2.31.0
+chardet>=5.1.0
+
+# Pour le build en executable
+pyinstaller>=5.13.0
