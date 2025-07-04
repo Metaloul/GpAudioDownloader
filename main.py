@@ -8,17 +8,206 @@ Application pour télécharger des fichiers audio basés sur des fichiers Guitar
 import sys
 import os
 import json
+import winreg
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
     QWidget, QPushButton, QLabel, QLineEdit, QFileDialog,
-    QProgressBar, QTextEdit, QGroupBox, QMessageBox, QMenuBar
+    QProgressBar, QTextEdit, QGroupBox, QMessageBox, QMenuBar,
+    QDialog, QCheckBox, QDialogButtonBox, QSystemTrayIcon, QMenu
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QIcon, QAction
 
 from downloader import AudioDownloader
 from gp_parser import GuitarProParser
+
+
+class PreferencesDialog(QDialog):
+    """Dialogue des préférences de l'application"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Préférences")
+        self.setModal(True)
+        self.setFixedSize(400, 200)
+        
+        # Layout principal
+        layout = QVBoxLayout(self)
+        
+        # Groupe démarrage
+        startup_group = QGroupBox("Démarrage")
+        startup_layout = QVBoxLayout(startup_group)
+        
+        # Case à cocher pour le démarrage automatique
+        self.auto_start_checkbox = QCheckBox("Démarrer automatiquement avec Windows")
+        self.auto_start_checkbox.setChecked(self.is_auto_start_enabled())
+        self.auto_start_checkbox.stateChanged.connect(self.on_auto_start_changed)
+        startup_layout.addWidget(self.auto_start_checkbox)
+        
+        # Case à cocher pour le démarrage minimisé
+        self.start_minimized_checkbox = QCheckBox("Démarrer en mode minimisé")
+        self.start_minimized_checkbox.setChecked(self.is_start_minimized_enabled())
+        self.start_minimized_checkbox.stateChanged.connect(self.on_start_minimized_changed)
+        startup_layout.addWidget(self.start_minimized_checkbox)
+        
+        layout.addWidget(startup_group)
+        
+        # Boutons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+    def is_auto_start_enabled(self):
+        """Vérifier si le démarrage automatique est activé"""
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_READ
+            )
+            try:
+                winreg.QueryValueEx(key, "GP Audio Downloader")
+                winreg.CloseKey(key)
+                return True
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return False
+        except Exception:
+            return False
+            
+    def is_start_minimized_enabled(self):
+        """Vérifier si le démarrage minimisé est activé"""
+        try:
+            config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get('start_minimized', False)
+        except Exception:
+            pass
+        return False
+        
+    def set_auto_start(self, enabled):
+        """Activer/désactiver le démarrage automatique"""
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE
+            )
+            
+            if enabled:
+                # Ajouter l'entrée de démarrage automatique
+                app_path = sys.executable
+                script_path = os.path.abspath(__file__)
+                # Ajouter --minimized si le démarrage minimisé est activé
+                if self.start_minimized_checkbox.isChecked():
+                    command = f'"{app_path}" "{script_path}" --minimized'
+                else:
+                    command = f'"{app_path}" "{script_path}"'
+                winreg.SetValueEx(key, "GP Audio Downloader", 0, winreg.REG_SZ, command)
+            else:
+                # Supprimer l'entrée de démarrage automatique
+                try:
+                    winreg.DeleteValue(key, "GP Audio Downloader")
+                except FileNotFoundError:
+                    pass  # L'entrée n'existe pas
+                    
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            print(f"Erreur lors de la configuration du démarrage automatique: {e}")
+            return False
+            
+    def set_start_minimized(self, enabled):
+        """Activer/désactiver le démarrage minimisé"""
+        try:
+            config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+            config = {}
+            
+            # Charger la configuration existante
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    
+            # Mettre à jour la préférence
+            config['start_minimized'] = enabled
+            
+            # Sauvegarder
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                
+            return True
+        except Exception as e:
+            print(f"Erreur lors de la configuration du démarrage minimisé: {e}")
+            return False
+            
+    def apply_preferences(self):
+        """Appliquer les préférences sélectionnées"""
+        auto_start_success = self.set_auto_start(self.auto_start_checkbox.isChecked())
+        minimized_success = self.set_start_minimized(self.start_minimized_checkbox.isChecked())
+        
+        if not auto_start_success:
+            QMessageBox.warning(
+                self,
+                "Attention",
+                "Impossible de configurer le démarrage automatique.\n"
+                "Vérifiez les permissions d'accès au registre Windows."
+            )
+            
+        if not minimized_success:
+            QMessageBox.warning(
+                self,
+                "Attention",
+                "Impossible de sauvegarder la préférence de démarrage minimisé."
+            )
+            
+        return auto_start_success and minimized_success
+         
+    def on_auto_start_changed(self, state):
+        """Gérer le changement de l'option de démarrage automatique"""
+        enabled = state == Qt.CheckState.Checked.value
+        success = self.set_auto_start(enabled)
+        
+        if not success:
+            # Remettre l'état précédent en cas d'échec
+            self.auto_start_checkbox.blockSignals(True)
+            self.auto_start_checkbox.setChecked(not enabled)
+            self.auto_start_checkbox.blockSignals(False)
+            
+            QMessageBox.warning(
+                self,
+                "Erreur",
+                "Impossible de configurer le démarrage automatique.\n"
+                "Vérifiez les permissions d'accès au registre Windows."
+            )
+            
+    def on_start_minimized_changed(self, state):
+        """Gérer le changement de l'option de démarrage minimisé"""
+        enabled = state == Qt.CheckState.Checked.value
+        success = self.set_start_minimized(enabled)
+        
+        if not success:
+            # Remettre l'état précédent en cas d'échec
+            self.start_minimized_checkbox.blockSignals(True)
+            self.start_minimized_checkbox.setChecked(not enabled)
+            self.start_minimized_checkbox.blockSignals(False)
+            
+            QMessageBox.warning(
+                self,
+                "Erreur",
+                "Impossible de sauvegarder la préférence de démarrage minimisé."
+            )
+        else:
+            # Mettre à jour la commande de démarrage automatique si nécessaire
+            if self.auto_start_checkbox.isChecked():
+                self.set_auto_start(True)
 
 
 class DownloadWorker(QThread):
@@ -235,6 +424,7 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.load_settings()
         self.setup_icon()
+        self.setup_system_tray()
         
     def setup_icon(self):
         """Configurer l'icône de l'application"""
@@ -251,9 +441,109 @@ class MainWindow(QMainWindow):
         except Exception as e:
              print(f"Erreur lors du chargement de l'icône: {e}")
      
+    def setup_system_tray(self):
+        """Configurer l'icône de la zone de notification"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            QMessageBox.critical(self, "Erreur", "La zone de notification n'est pas disponible sur ce système.")
+            return
+            
+        # Créer l'icône de la zone de notification
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # Utiliser la même icône que l'application
+        icon_path = os.path.join(os.path.dirname(__file__), "app_logo.ico")
+        if os.path.exists(icon_path):
+            self.tray_icon.setIcon(QIcon(icon_path))
+        else:
+            icon_path = os.path.join(os.path.dirname(__file__), "app_logo.png")
+            if os.path.exists(icon_path):
+                self.tray_icon.setIcon(QIcon(icon_path))
+            else:
+                # Icône par défaut si aucune icône n'est trouvée
+                self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
+        
+        # Créer le menu contextuel
+        tray_menu = QMenu()
+        
+        # Action pour afficher la fenêtre
+        show_action = QAction("Afficher", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+        
+        tray_menu.addSeparator()
+        
+        # Action pour les préférences
+        prefs_action = QAction("Préférences...", self)
+        prefs_action.triggered.connect(self.show_preferences)
+        tray_menu.addAction(prefs_action)
+        
+        tray_menu.addSeparator()
+        
+        # Action pour quitter
+        quit_action = QAction("Quitter", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(quit_action)
+        
+        # Associer le menu à l'icône
+        self.tray_icon.setContextMenu(tray_menu)
+        
+        # Gérer le double-clic sur l'icône
+        self.tray_icon.activated.connect(self.tray_icon_activated)
+        
+        # Afficher l'icône
+        self.tray_icon.show()
+        
+        # Message de bienvenue
+        self.tray_icon.setToolTip("GP Audio Downloader")
+        
+    def tray_icon_activated(self, reason):
+        """Gérer les clics sur l'icône de la zone de notification"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            if self.isVisible():
+                self.hide_window()
+            else:
+                self.show_window()
+                
+    def show_window(self):
+        """Afficher la fenêtre principale"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        
+    def hide_window(self):
+        """Masquer la fenêtre principale"""
+        self.hide()
+        
+    def quit_application(self):
+        """Quitter complètement l'application"""
+        if self.download_worker and self.download_worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Confirmation",
+                "Un téléchargement est en cours. Voulez-vous vraiment quitter ?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.download_worker.stop()
+                self.download_worker.wait(3000)
+                QApplication.quit()
+        else:
+            QApplication.quit()
+     
     def create_menu(self):
         """Créer le menu de l'application"""
         menubar = self.menuBar()
+        
+        # Menu Préférences
+        prefs_menu = menubar.addMenu('Préférences')
+        
+        # Action pour les préférences
+        preferences_action = QAction('Préférences...', self)
+        preferences_action.setStatusTip('Configurer les préférences de l\'application')
+        preferences_action.triggered.connect(self.show_preferences)
+        prefs_menu.addAction(preferences_action)
         
         # Menu Outils
         tools_menu = menubar.addMenu('Outils')
@@ -607,6 +897,11 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setVisible(False)
                 self.status_text.append("🛑 Téléchargement arrêté par l'utilisateur")
                 
+    def show_preferences(self):
+        """Afficher le dialogue des préférences"""
+        dialog = PreferencesDialog(self)
+        dialog.exec()  # Les préférences se sauvegardent automatiquement
+            
     def show_about(self):
         """Afficher les informations sur l'application"""
         QMessageBox.about(
@@ -687,23 +982,36 @@ class MainWindow(QMainWindow):
                 
     def closeEvent(self, event):
         """Gérer la fermeture de l'application"""
-        if self.download_worker and self.download_worker.isRunning():
-            reply = QMessageBox.question(
-                self,
-                "Confirmation",
-                "Un téléchargement est en cours. Voulez-vous vraiment quitter ?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
+        # Au lieu de fermer l'application, la masquer dans la zone de notification
+        if self.tray_icon.isVisible():
+            self.hide()
+            self.tray_icon.showMessage(
+                "GP Audio Downloader",
+                "L'application continue de fonctionner dans la zone de notification. "
+                "Double-cliquez sur l'icône pour la réafficher.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
             )
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                self.download_worker.stop()
-                self.download_worker.wait(3000)  # Attendre 3 secondes max
-                event.accept()
-            else:
-                event.ignore()
+            event.ignore()
         else:
-            event.accept()
+            # Si la zone de notification n'est pas disponible, fermer normalement
+            if self.download_worker and self.download_worker.isRunning():
+                reply = QMessageBox.question(
+                    self,
+                    "Confirmation",
+                    "Un téléchargement est en cours. Voulez-vous vraiment quitter ?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.download_worker.stop()
+                    self.download_worker.wait(3000)  # Attendre 3 secondes max
+                    event.accept()
+                else:
+                    event.ignore()
+            else:
+                event.accept()
 
 
 def main():
@@ -713,7 +1021,34 @@ def main():
     app.setApplicationVersion("1.0")
     
     window = MainWindow()
-    window.show()
+    
+    # Vérifier si l'application doit démarrer minimisée
+    should_start_minimized = False
+    
+    # Vérifier les arguments de ligne de commande
+    if "--minimized" in sys.argv:
+        should_start_minimized = True
+    else:
+        # Vérifier les préférences sauvegardées
+        try:
+            config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    should_start_minimized = config.get('start_minimized', False)
+        except Exception:
+            pass
+    
+    if should_start_minimized:
+        # Ne pas afficher la fenêtre, elle restera dans la zone de notification
+        window.tray_icon.showMessage(
+            "GP Audio Downloader",
+            "L'application a démarré et est disponible dans la zone de notification.",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000
+        )
+    else:
+        window.show()
     
     sys.exit(app.exec())
 
