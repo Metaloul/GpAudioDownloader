@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QGroupBox, QMessageBox, QMenuBar,
     QDialog, QCheckBox, QDialogButtonBox, QSystemTrayIcon, QMenu
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QFileSystemWatcher, QTimer
 from PySide6.QtGui import QFont, QIcon, QAction
 
 from downloader import AudioDownloader
@@ -30,7 +30,7 @@ class PreferencesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Préférences")
         self.setModal(True)
-        self.setFixedSize(400, 200)
+        self.setFixedSize(400, 280)
         
         # Layout principal
         layout = QVBoxLayout(self)
@@ -52,6 +52,18 @@ class PreferencesDialog(QDialog):
         startup_layout.addWidget(self.start_minimized_checkbox)
         
         layout.addWidget(startup_group)
+        
+        # Groupe surveillance automatique
+        auto_watch_group = QGroupBox("Surveillance automatique")
+        auto_watch_layout = QVBoxLayout(auto_watch_group)
+        
+        # Case à cocher pour la surveillance automatique
+        self.auto_watch_checkbox = QCheckBox("Télécharger automatiquement les nouveaux fichiers GP")
+        self.auto_watch_checkbox.setChecked(self.is_auto_watch_enabled())
+        self.auto_watch_checkbox.stateChanged.connect(self.on_auto_watch_changed)
+        auto_watch_layout.addWidget(self.auto_watch_checkbox)
+        
+        layout.addWidget(auto_watch_group)
         
         # Boutons
         button_box = QDialogButtonBox(
@@ -88,6 +100,18 @@ class PreferencesDialog(QDialog):
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     return config.get('start_minimized', False)
+        except Exception:
+            pass
+        return False
+        
+    def is_auto_watch_enabled(self):
+        """Vérifier si la surveillance automatique est activée"""
+        try:
+            config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get('auto_watch', False)
         except Exception:
             pass
         return False
@@ -148,10 +172,34 @@ class PreferencesDialog(QDialog):
             print(f"Erreur lors de la configuration du démarrage minimisé: {e}")
             return False
             
+    def set_auto_watch(self, enabled):
+        """Activer/désactiver la surveillance automatique"""
+        try:
+            config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
+            config = {}
+            
+            # Charger la configuration existante
+            if os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    
+            # Mettre à jour la préférence
+            config['auto_watch'] = enabled
+            
+            # Sauvegarder
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                
+            return True
+        except Exception as e:
+            print(f"Erreur lors de la configuration de la surveillance automatique: {e}")
+            return False
+            
     def apply_preferences(self):
         """Appliquer les préférences sélectionnées"""
         auto_start_success = self.set_auto_start(self.auto_start_checkbox.isChecked())
         minimized_success = self.set_start_minimized(self.start_minimized_checkbox.isChecked())
+        auto_watch_success = self.set_auto_watch(self.auto_watch_checkbox.isChecked())
         
         if not auto_start_success:
             QMessageBox.warning(
@@ -168,7 +216,14 @@ class PreferencesDialog(QDialog):
                 "Impossible de sauvegarder la préférence de démarrage minimisé."
             )
             
-        return auto_start_success and minimized_success
+        if not auto_watch_success:
+            QMessageBox.warning(
+                self,
+                "Attention",
+                "Impossible de sauvegarder la préférence de surveillance automatique."
+            )
+            
+        return auto_start_success and minimized_success and auto_watch_success
          
     def on_auto_start_changed(self, state):
         """Gérer le changement de l'option de démarrage automatique"""
@@ -208,6 +263,195 @@ class PreferencesDialog(QDialog):
             # Mettre à jour la commande de démarrage automatique si nécessaire
             if self.auto_start_checkbox.isChecked():
                 self.set_auto_start(True)
+                
+    def on_auto_watch_changed(self, state):
+        """Gérer le changement de l'option de surveillance automatique"""
+        enabled = state == Qt.CheckState.Checked.value
+        success = self.set_auto_watch(enabled)
+        
+        if not success:
+            # Remettre l'état précédent en cas d'échec
+            self.auto_watch_checkbox.blockSignals(True)
+            self.auto_watch_checkbox.setChecked(not enabled)
+            self.auto_watch_checkbox.blockSignals(False)
+            
+            QMessageBox.warning(
+                self,
+                "Erreur",
+                "Impossible de sauvegarder la préférence de surveillance automatique."
+            )
+
+
+class SingleFileDownloadWorker(QThread):
+    """Thread worker pour le téléchargement d'un seul fichier en arrière-plan"""
+    progress_updated = Signal(int)
+    status_updated = Signal(str)
+    download_completed = Signal()
+    error_occurred = Signal(str)
+    
+    def __init__(self, file_path, output_path, exceptions=None):
+        super().__init__()
+        self.file_path = file_path
+        self.output_path = output_path
+        self.exceptions = exceptions or []
+        self.downloader = AudioDownloader(output_path)
+        self.parser = GuitarProParser()
+        self._stop_requested = False
+        
+    def stop(self):
+        """Arrêter le téléchargement"""
+        self._stop_requested = True
+        
+    def run(self):
+        try:
+            # Vérifier que le fichier existe et est un fichier GP
+            if not os.path.exists(self.file_path):
+                self.error_occurred.emit(f"Le fichier {self.file_path} n'existe pas.")
+                return
+                
+            if not self.parser.is_gp_file(self.file_path):
+                # Ce n'est pas un fichier GP, ignorer silencieusement
+                return
+                
+            # Charger le cache des fichiers déjà traités
+            cache_file = os.path.join(self.output_path, ".gp_downloader_cache.txt")
+            processed_files = self._load_cache(cache_file)
+            
+            # Vérifier si le fichier est dans le cache
+            if self.file_path in processed_files:
+                self.status_updated.emit(f"Fichier déjà traité: {os.path.basename(self.file_path)}")
+                self.download_completed.emit()
+                return
+                
+            # Extraire les métadonnées du fichier GP
+            metadata = self.parser.extract_metadata(self.file_path)
+            
+            # Vérifier les exceptions
+            if self._should_exclude(metadata):
+                self.status_updated.emit(f"Fichier exclu: {metadata['title']}")
+                self.download_completed.emit()
+                return
+                
+            # Vérifier si un fichier audio correspondant existe déjà
+            if self._audio_file_exists(metadata):
+                self.status_updated.emit(f"Audio existant: {metadata['title']}")
+                # Ajouter au cache même si on n'a pas téléchargé
+                processed_files.add(self.file_path)
+                self._save_cache(cache_file, processed_files)
+                self.download_completed.emit()
+                return
+                
+            # Télécharger le fichier audio
+            self.status_updated.emit(f"Téléchargement: {metadata['title']}")
+            self.progress_updated.emit(50)
+            
+            success = self.downloader.download_audio(metadata)
+            
+            if success:
+                self.status_updated.emit(f"Téléchargé: {metadata['title']}")
+                # Ajouter au cache
+                processed_files.add(self.file_path)
+                self._save_cache(cache_file, processed_files)
+                self.progress_updated.emit(100)
+            else:
+                self.status_updated.emit(f"Échec: {metadata['title']}")
+                self.error_occurred.emit(f"Échec du téléchargement pour {metadata['title']}")
+                
+            self.download_completed.emit()
+            
+        except Exception as e:
+            self.error_occurred.emit(f"Erreur lors du téléchargement: {str(e)}")
+            
+    def _should_exclude(self, metadata):
+        """Vérifier si un fichier doit être exclu selon les exceptions"""
+        if not self.exceptions:
+            return False
+            
+        # Créer une chaîne de recherche avec toutes les métadonnées
+        search_text = ' '.join([
+            metadata.get('title', ''),
+            metadata.get('artist', ''),
+            metadata.get('album', ''),
+            os.path.basename(metadata.get('file_path', ''))
+        ]).lower()
+        
+        # Vérifier si un mot-clé d'exception est présent
+        for exception in self.exceptions:
+            if exception.strip().lower() in search_text:
+                return True
+                
+        return False
+        
+    def _load_cache(self, cache_file):
+        """Charger la liste des fichiers déjà traités"""
+        processed_files = set()
+        try:
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        processed_files.add(line.strip())
+        except Exception as e:
+            print(f"Erreur lors du chargement du cache: {e}")
+        return processed_files
+        
+    def _save_cache(self, cache_file, processed_files):
+        """Sauvegarder la liste des fichiers traités"""
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                for file_path in sorted(processed_files):
+                    f.write(f"{file_path}\n")
+        except Exception as e:
+            print(f"Erreur lors de la sauvegarde du cache: {e}")
+    
+    def _audio_file_exists(self, metadata):
+        """Vérifier si un fichier audio correspondant existe déjà"""
+        try:
+            # Générer le nom de fichier attendu (même logique que dans downloader.py)
+            filename_parts = []
+            
+            if metadata.get('artist') and metadata['artist'].strip():
+                filename_parts.append(metadata['artist'].strip())
+                
+            if metadata.get('title') and metadata['title'].strip():
+                title = metadata['title'].strip()
+                # Nettoyer le titre
+                import re
+                title = re.sub(r'\.(gp[3-5x]?|tab)$', '', title, flags=re.IGNORECASE)
+                filename_parts.append(title)
+                
+            if not filename_parts:
+                # Fallback: utiliser le nom de fichier original
+                file_path = metadata.get('file_path', 'unknown')
+                filename_parts.append(Path(file_path).stem)
+                
+            filename = ' - '.join(filename_parts)
+            
+            # Nettoyer le nom de fichier (enlever les caractères non autorisés)
+            filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+            filename = re.sub(r'[\s]+', ' ', filename).strip()
+            
+            # Limiter la longueur
+            if len(filename) > 200:
+                filename = filename[:200]
+                
+            if not filename:
+                filename = 'unknown'
+            
+            # Extensions audio à vérifier
+            audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma']
+            
+            # Vérifier si un fichier avec ce nom existe dans le dossier de sortie
+            for ext in audio_extensions:
+                audio_file_path = os.path.join(self.output_path, f"{filename}{ext}")
+                if os.path.exists(audio_file_path):
+                    return True
+                    
+            return False
+            
+        except Exception as e:
+            print(f"Erreur lors de la vérification du fichier audio: {e}")
+            return False
 
 
 class DownloadWorker(QThread):
@@ -421,10 +665,13 @@ class MainWindow(QMainWindow):
         self.config_file = os.path.join(os.path.expanduser("~"), ".gp_downloader_config.json")
         self.download_worker = None
         self.is_paused = False
+        self.file_watcher = None
+        self.auto_watch_enabled = False
         self.init_ui()
         self.load_settings()
         self.setup_icon()
         self.setup_system_tray()
+        self.setup_file_watcher()
         
     def setup_icon(self):
         """Configurer l'icône de l'application"""
@@ -495,6 +742,175 @@ class MainWindow(QMainWindow):
         
         # Message de bienvenue
         self.tray_icon.setToolTip("GP Audio Downloader")
+        
+    def setup_file_watcher(self):
+        """Configurer la surveillance automatique des fichiers"""
+        self.file_watcher = QFileSystemWatcher()
+        self.file_watcher.directoryChanged.connect(self.on_directory_changed)
+        self.load_auto_watch_setting()
+        
+    def load_auto_watch_setting(self):
+        """Charger le paramètre de surveillance automatique"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    self.auto_watch_enabled = config.get('auto_watch', False)
+                    
+                    # Si la surveillance est activée et qu'un dossier est configuré
+                    if self.auto_watch_enabled:
+                        folder_path = config.get('folder_path', '')
+                        if folder_path and os.path.exists(folder_path):
+                            self.start_watching_folder(folder_path)
+        except Exception as e:
+            print(f"Erreur lors du chargement des paramètres de surveillance: {e}")
+            
+    def start_watching_folder(self, folder_path):
+        """Commencer la surveillance d'un dossier"""
+        if self.file_watcher and self.auto_watch_enabled:
+            # Arrêter la surveillance précédente
+            watched_dirs = self.file_watcher.directories()
+            if watched_dirs:
+                self.file_watcher.removePaths(watched_dirs)
+                
+            # Commencer la nouvelle surveillance
+            if os.path.exists(folder_path):
+                self.file_watcher.addPath(folder_path)
+                print(f"Surveillance automatique activée pour: {folder_path}")
+                
+                # Initialiser la liste des fichiers connus
+                try:
+                    parser = GuitarProParser()
+                    self.known_files = set(parser.find_gp_files(folder_path))
+                    print(f"Fichiers GP connus initialisés: {len(self.known_files)} fichiers")
+                except Exception as e:
+                    print(f"Erreur lors de l'initialisation des fichiers connus: {e}")
+                    self.known_files = set()
+                
+    def stop_watching_folder(self):
+        """Arrêter la surveillance du dossier"""
+        if self.file_watcher:
+            watched_dirs = self.file_watcher.directories()
+            if watched_dirs:
+                self.file_watcher.removePaths(watched_dirs)
+                print("Surveillance automatique désactivée")
+                
+    def on_directory_changed(self, path):
+        """Gérer les changements dans le dossier surveillé"""
+        if not self.auto_watch_enabled:
+            return
+            
+        # Vérifier qu'on a un dossier de sortie configuré
+        output_path = self.output_path_edit.text()
+        if not output_path or not os.path.exists(output_path):
+            return
+            
+        # Éviter de lancer plusieurs téléchargements simultanés
+        if hasattr(self, 'single_file_worker') and self.single_file_worker and self.single_file_worker.isRunning():
+            return
+            
+        print(f"Changement détecté dans: {path}")
+        
+        # Attendre un peu pour que le fichier soit complètement écrit
+        QTimer.singleShot(1000, lambda: self.detect_new_files(path, output_path))
+        
+    def detect_new_files(self, folder_path, output_path):
+        """Détecter les nouveaux fichiers GP dans le dossier"""
+        try:
+            # Obtenir tous les fichiers GP actuels
+            parser = GuitarProParser()
+            current_files = set(parser.find_gp_files(folder_path))
+            
+            # Comparer avec les fichiers connus (stockés dans un attribut de classe)
+            if not hasattr(self, 'known_files'):
+                self.known_files = current_files
+                return
+                
+            # Trouver les nouveaux fichiers
+            new_files = current_files - self.known_files
+            
+            if new_files:
+                # Prendre le premier nouveau fichier détecté
+                new_file = next(iter(new_files))
+                print(f"Nouveau fichier détecté: {new_file}")
+                
+                # Mettre à jour la liste des fichiers connus
+                self.known_files = current_files
+                
+                # Télécharger ce fichier spécifique
+                self.auto_download_single_file(new_file, output_path)
+            else:
+                # Mettre à jour la liste des fichiers connus même s'il n'y a pas de nouveaux fichiers
+                self.known_files = current_files
+                
+        except Exception as e:
+            print(f"Erreur lors de la détection des nouveaux fichiers: {e}")
+        
+    def auto_download_single_file(self, file_path, output_path):
+        """Télécharger automatiquement un seul fichier détecté"""
+        try:
+            # Obtenir les exceptions
+            exceptions_text = self.exceptions_edit.toPlainText()
+            exceptions = [line.strip() for line in exceptions_text.split('\n') if line.strip()]
+            
+            # Créer et démarrer le worker de téléchargement pour un seul fichier
+            self.single_file_worker = SingleFileDownloadWorker(file_path, output_path, exceptions)
+            self.single_file_worker.status_updated.connect(lambda msg: self.update_status(f"🔄 Auto: {msg}"))
+            self.single_file_worker.download_completed.connect(self.on_auto_download_completed)
+            self.single_file_worker.error_occurred.connect(self.on_download_error)
+            
+            # Afficher une notification
+            if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "GP Audio Downloader",
+                    f"Téléchargement automatique: {os.path.basename(file_path)}",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
+            
+            self.single_file_worker.start()
+            
+        except Exception as e:
+            print(f"Erreur lors du téléchargement automatique: {e}")
+            
+    def auto_download_new_files(self, folder_path, output_path):
+        """Télécharger automatiquement les nouveaux fichiers détectés"""
+        try:
+            # Obtenir les exceptions
+            exceptions_text = self.exceptions_edit.toPlainText()
+            exceptions = [line.strip() for line in exceptions_text.split('\n') if line.strip()]
+            
+            # Créer et démarrer le worker de téléchargement
+            self.download_worker = DownloadWorker(folder_path, output_path, exceptions)
+            self.download_worker.progress_updated.connect(self.update_progress)
+            self.download_worker.status_updated.connect(self.update_status)
+            self.download_worker.download_completed.connect(self.on_auto_download_completed)
+            self.download_worker.error_occurred.connect(self.on_download_error)
+            
+            # Afficher une notification
+            if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "GP Audio Downloader",
+                    "Téléchargement automatique en cours...",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
+            
+            self.download_worker.start()
+            
+        except Exception as e:
+            print(f"Erreur lors du téléchargement automatique: {e}")
+            
+    def on_auto_download_completed(self):
+        """Gérer la fin du téléchargement automatique"""
+        self.update_status("✅ Auto: Téléchargement automatique terminé")
+        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(
+                "GP Audio Downloader",
+                "Téléchargement automatique terminé",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
         
     def tray_icon_activated(self, reason):
         """Gérer les clics sur l'icône de la zone de notification"""
@@ -777,6 +1193,10 @@ class MainWindow(QMainWindow):
             self.save_settings()
             self.check_ready_to_download()
             
+            # Mettre à jour la surveillance automatique si elle est activée
+            if self.auto_watch_enabled:
+                self.start_watching_folder(folder)
+            
     def browse_output_folder(self):
         """Ouvrir le dialogue de sélection du dossier de sortie"""
         # Utiliser le dernier dossier utilisé comme point de départ
@@ -861,6 +1281,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "Erreur", error_message)
         
+    def on_download_error(self, error_message):
+        """Gérer les erreurs lors du téléchargement automatique"""
+        self.update_status(f"❌ Auto: Erreur - {error_message}")
+        print(f"Erreur lors du téléchargement automatique: {error_message}")
+        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(
+                "GP Audio Downloader",
+                f"Erreur de téléchargement: {error_message}",
+                QSystemTrayIcon.MessageIcon.Critical,
+                5000
+            )
+        
     def toggle_pause(self):
         """Basculer entre pause et reprise"""
         if self.download_worker and self.download_worker.isRunning():
@@ -900,7 +1332,11 @@ class MainWindow(QMainWindow):
     def show_preferences(self):
         """Afficher le dialogue des préférences"""
         dialog = PreferencesDialog(self)
-        dialog.exec()  # Les préférences se sauvegardent automatiquement
+        result = dialog.exec()
+        
+        # Recharger les paramètres de surveillance automatique après fermeture du dialogue
+        if result == QDialog.DialogCode.Accepted:
+            self.load_auto_watch_setting()  # Les préférences se sauvegardent automatiquement
             
     def show_about(self):
         """Afficher les informations sur l'application"""
@@ -969,11 +1405,18 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         """Sauvegarder les paramètres actuels"""
         try:
-            config = {
+            # Charger la configuration existante pour préserver les autres paramètres
+            config = {}
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+            
+            # Mettre à jour avec les paramètres actuels
+            config.update({
                 'folder_path': self.folder_path_edit.text(),
                 'output_path': self.output_path_edit.text(),
                 'exceptions': [line.strip() for line in self.exceptions_edit.toPlainText().split('\n') if line.strip()]
-            }
+            })
             
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)

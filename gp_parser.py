@@ -34,6 +34,14 @@ class GuitarProParser:
                 
         return sorted(gp_files)
         
+    def is_gp_file(self, file_path: str) -> bool:
+        """Vérifier si un fichier est un fichier Guitar Pro valide"""
+        if not os.path.exists(file_path):
+            return False
+            
+        file_ext = Path(file_path).suffix.lower()
+        return file_ext in self.GP_EXTENSIONS
+        
     def extract_metadata(self, file_path: str) -> Dict[str, str]:
         """Extraire les métadonnées d'un fichier Guitar Pro"""
         try:
